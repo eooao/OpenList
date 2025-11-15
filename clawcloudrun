@@ -1,0 +1,217 @@
+apiVersion: app.claw.cloud/v1
+kind: Template
+metadata:
+  name: openlist
+spec:
+  title: 'OpenList'
+  type: community
+  author: ClawCloud Run
+  author_id: 180503656
+  date: 2025-08-23
+  description: 'OpenList — 简洁的文件/目录索引与分享服务。'
+  templateType: inline
+  categories:
+    - tools
+    - file
+  defaults:
+    app_host:
+      type: string
+      value: ${{ random(8) }}
+    app_name:
+      type: string
+      value: openlist-${{ random(8) }}
+  inputs:
+    image_tag:
+      description: 'OpenList 镜像标签（如 latest-lite）'
+      type: string
+      default: 'latest-lite'
+      required: true
+    uid:
+      description: '容器运行用户 UID（建议替换为宿主机实际 UID）'
+      type: string
+      default: '0'
+      required: true
+    gid:
+      description: '容器运行用户 GID（建议替换为宿主机实际 GID）'
+      type: string
+      default: '0'
+      required: true
+    umask:
+      description: 'UMASK（文件权限掩码）'
+      type: string
+      default: '022'
+      required: true
+    storage_size:
+      description: '数据卷大小（如 1Gi / 5Gi）'
+      type: string
+      default: '1Gi'
+      required: true
+    enableIngress:
+      description: '是否创建 Ingress 对外暴露（域名访问）'
+      type: choice
+      options: ['true', 'false']
+      default: 'true'
+      required: true
+    enableNodePort:
+      description: '是否创建 NodePort 服务对外暴露（主机端口访问）'
+      type: choice
+      options: ['false', 'true']
+      default: 'false'
+      required: true
+
+---
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${{ defaults.app_name }}
+  annotations:
+    originImageName: openlistteam/openlist:latest-lite
+    deploy.run.claw.cloud/minReplicas: '1'
+    deploy.run.claw.cloud/maxReplicas: '1'
+  labels:
+    run.claw.cloud/app-deploy-manager: ${{ defaults.app_name }}
+    app: ${{ defaults.app_name }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  minReadySeconds: 5
+  serviceName: ${{ defaults.app_name }}
+  selector:
+    matchLabels:
+      app: ${{ defaults.app_name }}
+  template:
+    metadata:
+      labels:
+        app: ${{ defaults.app_name }}
+    spec:
+      terminationGracePeriodSeconds: 10
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: ${{ inputs.gid }}
+      containers:
+        - name: ${{ defaults.app_name }}
+          image: openlistteam/openlist:${{ inputs.image_tag }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: ${{ inputs.uid }}
+            runAsGroup: ${{ inputs.gid }}
+          env:
+            - name: UMASK
+              value: "${{ inputs.umask }}"
+          ports:
+            - containerPort: 5244
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /opt/openlist/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          path: /opt/openlist/data
+          value: '1'
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: ${{ inputs.storage_size }}
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${{ defaults.app_name }}
+  labels:
+    run.claw.cloud/app-deploy-manager: ${{ defaults.app_name }}
+spec:
+  ports:
+    - name: http
+      port: 5244
+      targetPort: 5244
+      protocol: TCP
+  selector:
+    app: ${{ defaults.app_name }}
+
+${{ if(inputs.enableNodePort === 'true') }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${{ defaults.app_name }}-nodeport
+  labels:
+    run.claw.cloud/app-deploy-manager: ${{ defaults.app_name }}
+spec:
+  type: NodePort
+  selector:
+    app: ${{ defaults.app_name }}
+  ports:
+    - name: http
+      port: 5244
+      targetPort: 5244
+      protocol: TCP
+${{ endif() }}
+
+${{ if(inputs.enableIngress === 'true') }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${{ defaults.app_name }}
+  labels:
+    run.claw.cloud/app-deploy-manager: ${{ defaults.app_name }}
+    run.claw.cloud/app-deploy-manager-domain: ${{ defaults.app_host }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: 'false'
+    nginx.ingress.kubernetes.io/backend-protocol: HTTP
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: 32m
+    nginx.ingress.kubernetes.io/server-snippet: |
+      client_header_buffer_size 64k;
+      large_client_header_buffers 4 128k;
+    nginx.ingress.kubernetes.io/client-body-buffer-size: 64k
+    nginx.ingress.kubernetes.io/proxy-buffer-size: 64k
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      if ($request_uri ~* \.(js|css|gif|jpe?g|png)) {
+        expires 30d;
+        add_header Cache-Control "public";
+      }
+spec:
+  rules:
+    - host: ${{ defaults.app_host }}.${{ CLAWCLOUD_CLOUD_DOMAIN }}
+      http:
+        paths:
+          - pathType: Prefix
+            path: /()(.*)
+            backend:
+              service:
+                name: ${{ defaults.app_name }}
+                port:
+                  number: 5244
+  tls:
+    - hosts:
+        - ${{ defaults.app_host }}.${{ CLAWCLOUD_CLOUD_DOMAIN }}
+      secretName: ${{ CLAWCLOUD_CERT_SECRET_NAME }}
+${{ endif() }}
+
+---
+apiVersion: app.claw.cloud/v1
+kind: App
+metadata:
+  name: ${{ defaults.app_name }}
+  labels:
+    run.claw.cloud/app-deploy-manager: ${{ defaults.app_name }}
+spec:
+  name: ${{ defaults.app_name }}
+  displayType: normal
+  type: link
+  data:
+    url: https://${{ defaults.app_host }}.${{ CLAWCLOUD_CLOUD_DOMAIN }}
